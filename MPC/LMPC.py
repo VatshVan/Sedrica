@@ -16,7 +16,6 @@ L_VEHICLE = 0.33
 W_TRACK = 4.0       
 FILENAME = 'raceline.csv' 
 
-# 1. TRACK MANAGER
 class TrackManager:
     def __init__(self, filename, width=4.0):
         self.width = width
@@ -57,7 +56,6 @@ class TrackManager:
 
     def get_reference(self, x_car, y_car, horizon):
         dist, idx = self.kdtree.query([x_car, y_car])
-        
         indices = np.arange(idx, idx + horizon + 1) % self.N_points
         ref_x = self.path[indices, 0]
         ref_y = self.path[indices, 1]
@@ -65,11 +63,11 @@ class TrackManager:
         
         k_max = np.max(np.abs(self.curvature[indices]))
         v_limit = np.sqrt(4.0 / (k_max + 1e-3)) 
-        v_limit = np.clip(v_limit, 1.0, 6.0) 
+        
+        v_limit = np.clip(v_limit, 1.0, 4.0)
         
         return ref_x, ref_y, ref_psi, v_limit, idx, dist
 
-# 2. LMPC LEARNER
 class LMPCLearner:
     def __init__(self):
         self.X, self.U, self.X_next, self.X_nom = None, None, None, None
@@ -105,7 +103,6 @@ class LMPCLearner:
             self.Ce = (1-alpha)*self.Ce + alpha*np.clip(Theta[:, 6:7], -1, 1)
         except: pass
 
-# 3. CASADI MPC
 class CasadiMPC:
     def __init__(self):
         self.opti = ca.Opti()
@@ -125,7 +122,6 @@ class CasadiMPC:
             err_path = 2.0*((self.X[0, k] - self.P_ref[0, k])**2 + (self.X[1, k] - self.P_ref[1, k])**2)
             err_vel = 1.0*(self.X[2, k] - self.P_v_tgt)**2
             
-            # Damping
             if k == 0:
                 delta_u_acc = (self.U[0, k] - self.P_u_prev[0])**2
                 delta_u_steer = (self.U[1, k] - self.P_u_prev[1])**2
@@ -133,7 +129,8 @@ class CasadiMPC:
                 delta_u_acc = (self.U[0, k] - self.U[0, k-1])**2
                 delta_u_steer = (self.U[1, k] - self.U[1, k-1])**2
             
-            damping = 5.0 * delta_u_acc + 200.0 * delta_u_steer
+            damping = 5.0 * delta_u_acc + 500.0 * delta_u_steer
+            
             cost += err_path + err_vel + 0.1*self.U[0, k]**2 + damping
             
         self.opti.minimize(cost)
@@ -174,7 +171,6 @@ class CasadiMPC:
         except:
             return np.array([-1.0, 0.0]), np.repeat(x0.reshape(-1,1), self.N+1, axis=1)
 
-# 4. ROS NODE
 class LMPCNode(Node):
     def __init__(self):
         super().__init__('lmpc_node')
@@ -190,7 +186,6 @@ class LMPCNode(Node):
         self.prev_state = None
         self.prev_u = np.zeros(2)
         
-        # Yaw Unwrapping
         self.last_yaw = 0.0
         self.unwrapped_yaw = 0.0
         self.first_run = True
@@ -200,9 +195,7 @@ class LMPCNode(Node):
         self.aggressiveness = 0.5
         self.is_racing = False
         
-        # --- NEW: TIMING VARIABLES ---
         self.lap_start_time = None
-        self.last_lap_time = 0.0
         
         self.pub_drive = self.create_publisher(AckermannDriveStamped, self.get_parameter('drive_topic').value, 10)
         self.create_subscription(Odometry, self.get_parameter('odom_topic').value, self.odom_callback, 10)
@@ -236,7 +229,6 @@ class LMPCNode(Node):
 
         v = np.sqrt(msg.twist.twist.linear.x**2 + msg.twist.twist.linear.y**2)
         if msg.twist.twist.linear.x < 0: v = -v
-        
         self.current_state = np.array([px, py, v, self.unwrapped_yaw])
 
     def get_nominal_dynamics(self, x, u):
@@ -252,10 +244,9 @@ class LMPCNode(Node):
         if self.current_state is None: return
         x = self.current_state
         
-        # --- SAFETY LOCK ---
         rx, ry, rpsi, v_max, idx, dist_to_track = self.track.get_reference(x[0], x[1], N_HORIZON)
         
-        if dist_to_track > 3.0:
+        if dist_to_track > 10.0:
             self.get_logger().warn(f"Car is {dist_to_track:.2f}m from track. Move closer to start!", throttle_duration_sec=1.0)
             msg = AckermannDriveStamped()
             msg.header.stamp = self.get_clock().now().to_msg()
@@ -263,7 +254,6 @@ class LMPCNode(Node):
             self.pub_drive.publish(msg)
             self.publish_global_track()
             return
-        # -------------------
 
         if self.prev_state is not None and self.is_racing:
             x_nom = self.get_nominal_dynamics(self.prev_state, self.prev_u)
@@ -271,10 +261,9 @@ class LMPCNode(Node):
             self.lap_data['X_n'].append(x); self.lap_data['X_nom'].append(x_nom)
             if len(self.lap_data['X']) % 10 == 0: self.learner.update_error_model(x)
 
-        # --- LAP LOGIC (WITH TIMING) ---
         if not self.is_racing and idx > 50:
             self.is_racing = True
-            self.lap_start_time = self.get_clock().now() # Start Timer
+            self.lap_start_time = self.get_clock().now()
             self.get_logger().info(f"Started Lap {self.lap_count}!")
             
         if self.is_racing and idx < 20 and len(self.lap_data['X']) > 200: 
@@ -297,12 +286,9 @@ class LMPCNode(Node):
         self.prev_state = x.copy(); self.prev_u = u_opt.copy()
 
     def finish_lap(self):
-        # Calculate Time
         current_time = self.get_clock().now()
         elapsed = (current_time - self.lap_start_time).nanoseconds / 1e9
-        
         self.get_logger().info(f"Lap {self.lap_count} Complete! Time: {elapsed:.2f}s")
-        self.last_lap_time = elapsed
         
         X_arr = np.array(self.lap_data['X'])
         if len(X_arr) > 50:
@@ -310,9 +296,14 @@ class LMPCNode(Node):
             self.lap_count += 1
             self.aggressiveness = min(0.9, self.aggressiveness + 0.1)
             self.get_logger().info(f"Aggressiveness increased to {self.aggressiveness}")
-            
+        
+        if self.lap_count >= 10:
+            self.get_logger().info("RACE COMPLETE! Stopping Car.")
+            stop_msg = AckermannDriveStamped()
+            self.pub_drive.publish(stop_msg)
+            raise SystemExit
+        
         self.lap_data = {'X':[], 'U':[], 'X_n':[], 'X_nom':[]}
-        # Restart timer for next lap immediately
         self.is_racing = True
         self.lap_start_time = self.get_clock().now()
 
@@ -327,13 +318,10 @@ class LMPCNode(Node):
         msg = Marker(); msg.header.frame_id = "map"; msg.id = 501; msg.type = Marker.TEXT_VIEW_FACING; msg.action = Marker.ADD
         msg.scale.z = 1.5; msg.color.a = 1.0; msg.color.r = 1.0; msg.color.g = 1.0; msg.color.b = 1.0 
         msg.pose.position.x = self.current_state[0]; msg.pose.position.y = self.current_state[1]; msg.pose.position.z = 1.0 
-        
-        # Format text to show running time
         time_str = "0.0s"
         if self.is_racing and self.lap_start_time is not None:
              current = (self.get_clock().now() - self.lap_start_time).nanoseconds / 1e9
              time_str = f"{current:.1f}s"
-        
         msg.text = f"LAP: {self.lap_count} | {time_str}"
         self.pub_lap_text.publish(msg)
 

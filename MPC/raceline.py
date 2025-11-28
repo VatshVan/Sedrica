@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 N = 1000
 t = np.linspace(0, 2*np.pi, N, endpoint=False)
 
-R = 50 + 3.5*np.sin(2*t) + 2.0*np.sin(4*t + 0.6) + 1.2*np.cos(6*t - 0.3)
+R = 20 + 3.5*np.sin(2*t) + 2.0*np.sin(4*t + 0.6) + 1.2*np.cos(6*t - 0.3)
 bulge = 3.2 * np.exp(-((t - 1.7*np.pi) % (2*np.pi) - np.pi)**2 / 0.6)
 R = R + bulge
 
@@ -55,7 +55,7 @@ df_end = df.iloc[[0]].copy()
 df_end['idx'] = N
 df2 = pd.concat([df, df_end], ignore_index=True)
 
-out_path = 'MPC/raceline.csv'
+out_path = 'raceline.csv'
 df2.to_csv(out_path, index=False)
 print(f"Track generated: {out_path}")
 
@@ -67,4 +67,4 @@ plt.axis('equal')
 plt.title("Generated Complex Track")
 plt.legend()
 plt.grid(True)
-plt.savefig("MPC/raceline.png")
+plt.savefig("raceline.png")

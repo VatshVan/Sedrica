@@ -198,6 +198,8 @@ class LMPCNode(Node):
 
         u_opt, pred = self.mpc.solve(x, [rx, ry, rpsi], v_max * self.aggressiveness, self.learner.Ae, self.learner.Be, self.learner.Ce, self.prev_u)
         
+        print(f"Action -> Throttle: {u_opt[0]:.2f} | Steer: {u_opt[1]:.2f} | DistToTrack: {dist:.2f}")
+        
         t_msg = Float32(); t_msg.data = float(np.clip(u_opt[0]/MAX_ACCEL, -1.0, 1.0))
         s_msg = Float32(); s_msg.data = float(np.clip(u_opt[1]/MAX_STEER_RAD, -1.0, 1.0))
         self.pub_throttle.publish(t_msg); self.pub_steering.publish(s_msg)

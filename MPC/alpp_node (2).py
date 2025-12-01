@@ -73,12 +73,12 @@ class AdaptivePurePursuit(Node):
         #self.path[:, [0, 1]] = self.path[:, [1, 0]]
         # self.path = self.path[::-1]
 
-        #for i in range(len(self.path)):
-            #self.path[i, 1] += 0
-            #self.path[i, 0] -= 0
+        # for i in range(len(self.path)):
+        #     self.path[i, 1] += 0
+        #     self.path[i, 0] -= 0
 
-        #rotation_matrix = np.array([[-0.06, 1], [-1, 0]])
-        #self.path = np.dot(self.path, rotation_matrix.T)
+        # rotation_matrix = np.array([[-0.06, 1], [-1, 0]])
+        # self.path = np.dot(self.path, rotation_matrix.T)
         print("RACELINE LOADED:", self.path.shape)
 
     # ------------------ IPS callback ------------------
@@ -177,100 +177,130 @@ class AdaptivePurePursuit(Node):
                 (self.max_lookahead - self.min_lookahead)
             self.lookahead_distance = min(self.max_lookahead, scaled_lookahead)
 
-
     def get_lookahead_point(self, position):
-        # robust closest index
-        # ensure path values are numeric (integers)
-        pts = np.array(self.path, dtype=float).astype(int)
+        # 1. FIX: Keep floats, do not convert to int
+        pts = np.array(self.path, dtype=float)
 
-        # print(np.array([int(position.x), int(position.y)]))
-        # print(self.path)
         dists = np.linalg.norm(pts - np.array([position.x, position.y]), axis=1)
         closest_idx = int(np.argmin(dists))
         closest_point = pts[closest_idx]
 
         goal_point = None
-
-    # choose a point ahead (search forward along path), ensure it's also in front of car
         heading_vec = np.array([np.cos(self.yaw), np.sin(self.yaw)])
-        if abs(self.yaw) < 1e-4:
-            print("❌❌❌ YAW IS ZERO — IMU NOT WORKING ❌❌❌")
 
-    # choose indices with a small forward margin to avoid immediate neighbors
+        # 2. FIX: Increase search window size (20 -> 100)
         min_idx = closest_idx + 2
-        max_idx = min(closest_idx + 20, len(pts)-1)  # search window
-        print(closest_point)
+        max_idx = min(closest_idx + 100, len(pts)-1) 
+
         for i in range(min_idx, max_idx+1):
             point = pts[i]
             vec_car_to_point = np.array([point[0] - position.x, point[1] - position.y])
             dist = np.linalg.norm(vec_car_to_point)
-            print("DOT:", np.dot(vec_car_to_point, heading_vec),"VEC:", vec_car_to_point,"HEAD:", heading_vec)
 
-            
-            # require lookahead distance AND that the point is in front of the car
+            # Debug print to see what the math is doing
+            # print(f"Idx: {i}, Dist: {dist:.2f}, Dot: {np.dot(vec_car_to_point, heading_vec):.2f}")
+
             if dist > self.lookahead_distance and np.dot(vec_car_to_point, heading_vec) > 0:
-                
                 goal_point = point
-                
-                # publish markers (kept same as original)
-                marker = Marker()
-                marker.header.frame_id = 'world'
-                marker.header.stamp = self.get_clock().now().to_msg()
-                marker.type = Marker.SPHERE
-                marker.action = Marker.ADD
-                marker.pose.position.x = point[0]
-                marker.pose.position.y = point[1]
-                marker.pose.position.z = 0.0
-                marker.scale.x = 0.1
-                marker.scale.y = 0.1
-                marker.scale.z = 0.1
-                marker.color.a = 1.0
-                marker.color.r = 1.0
-                marker.color.g = 0.0
-                marker.color.b = 0.0
-
-                marker2 = Marker()
-                marker2.header.frame_id = 'world'
-                marker2.header.stamp = self.get_clock().now().to_msg()
-                marker2.type = Marker.SPHERE
-                marker2.action = Marker.ADD
-                marker2.pose.position.x = closest_point[0]
-                marker2.pose.position.y = closest_point[1]
-                marker2.pose.position.z = 0.0
-                marker2.scale.x = 0.1
-                marker2.scale.y = 0.1
-                marker2.scale.z = 0.1
-                marker2.color.a = 1.0
-                marker2.color.r = 0.0
-                marker2.color.g = 0.0
-                marker2.color.b = 1.0
-
-                markerarray = MarkerArray()
-                for j in range(len(pts)):
-                    m = Marker()
-                    m.header.frame_id = 'world'
-                    m.header.stamp = self.get_clock().now().to_msg()
-                    m.type = Marker.SPHERE
-                    m.action = Marker.ADD
-                    m.id = j
-                    m.pose.position.x = pts[j][0]
-                    m.pose.position.y = pts[j][1]
-                    m.pose.position.z = 0.0
-                    m.scale.x = 0.1
-                    m.scale.y = 0.1
-                    m.scale.z = 0.1
-                    m.color.a = 1.0
-                    m.color.r = 0.0
-                    m.color.g = 1.0
-                    m.color.b = 0.0
-                    markerarray.markers.append(m)
-
-                self.goal_pub.publish(marker)
-                self.cp_pub.publish(marker2)
-                self.race_pub.publish(markerarray)
+                # ... (Markers code omitted for brevity, keep your original marker code here) ...
+                # ...
                 break
 
         return closest_point, goal_point
+
+    # def get_lookahead_point(self, position):
+    #     # robust closest index
+    #     # ensure path values are numeric (integers)
+    #     pts = np.array(self.path, dtype=float)
+
+    #     # print(np.array([int(position.x), int(position.y)]))
+    #     # print(self.path)
+    #     dists = np.linalg.norm(pts - np.array([position.x, position.y]), axis=1)
+    #     closest_idx = int(np.argmin(dists))
+    #     closest_point = pts[closest_idx]
+
+    #     goal_point = None
+
+    # # choose a point ahead (search forward along path), ensure it's also in front of car
+    #     heading_vec = np.array([np.cos(self.yaw), np.sin(self.yaw)])
+    #     if abs(self.yaw) < 1e-4:
+    #         print("❌❌❌ YAW IS ZERO — IMU NOT WORKING ❌❌❌")
+
+    # # choose indices with a small forward margin to avoid immediate neighbors
+    #     min_idx = closest_idx + 2
+    #     max_idx = min(closest_idx + 100, len(pts)-1)  # search window
+    #     print(closest_point)
+    #     for i in range(min_idx, max_idx+1):
+    #         point = pts[i]
+    #         vec_car_to_point = np.array([point[0] - position.x, point[1] - position.y])
+    #         dist = np.linalg.norm(vec_car_to_point)
+    #         print("DOT:", np.dot(vec_car_to_point, heading_vec),"VEC:", vec_car_to_point,"HEAD:", heading_vec)
+
+            
+    #         # require lookahead distance AND that the point is in front of the car
+    #         if dist > self.lookahead_distance and np.dot(vec_car_to_point, heading_vec) > 0:
+                
+    #             goal_point = point
+                
+    #             # publish markers (kept same as original)
+    #             marker = Marker()
+    #             marker.header.frame_id = 'world'
+    #             marker.header.stamp = self.get_clock().now().to_msg()
+    #             marker.type = Marker.SPHERE
+    #             marker.action = Marker.ADD
+    #             marker.pose.position.x = point[0]
+    #             marker.pose.position.y = point[1]
+    #             marker.pose.position.z = 0.0
+    #             marker.scale.x = 0.1
+    #             marker.scale.y = 0.1
+    #             marker.scale.z = 0.1
+    #             marker.color.a = 1.0
+    #             marker.color.r = 1.0
+    #             marker.color.g = 0.0
+    #             marker.color.b = 0.0
+
+    #             marker2 = Marker()
+    #             marker2.header.frame_id = 'world'
+    #             marker2.header.stamp = self.get_clock().now().to_msg()
+    #             marker2.type = Marker.SPHERE
+    #             marker2.action = Marker.ADD
+    #             marker2.pose.position.x = closest_point[0]
+    #             marker2.pose.position.y = closest_point[1]
+    #             marker2.pose.position.z = 0.0
+    #             marker2.scale.x = 0.1
+    #             marker2.scale.y = 0.1
+    #             marker2.scale.z = 0.1
+    #             marker2.color.a = 1.0
+    #             marker2.color.r = 0.0
+    #             marker2.color.g = 0.0
+    #             marker2.color.b = 1.0
+
+    #             markerarray = MarkerArray()
+    #             for j in range(len(pts)):
+    #                 m = Marker()
+    #                 m.header.frame_id = 'world'
+    #                 m.header.stamp = self.get_clock().now().to_msg()
+    #                 m.type = Marker.SPHERE
+    #                 m.action = Marker.ADD
+    #                 m.id = j
+    #                 m.pose.position.x = pts[j][0]
+    #                 m.pose.position.y = pts[j][1]
+    #                 m.pose.position.z = 0.0
+    #                 m.scale.x = 0.1
+    #                 m.scale.y = 0.1
+    #                 m.scale.z = 0.1
+    #                 m.color.a = 1.0
+    #                 m.color.r = 0.0
+    #                 m.color.g = 1.0
+    #                 m.color.b = 0.0
+    #                 markerarray.markers.append(m)
+
+    #             self.goal_pub.publish(marker)
+    #             self.cp_pub.publish(marker2)
+    #             self.race_pub.publish(markerarray)
+    #             break
+
+    #     return closest_point, goal_point
 
     def calculate_alpha(self, position, goal_point, yaw):
         dy = goal_point[1] - position.y

@@ -1,390 +1,393 @@
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Point, PoseWithCovarianceStamped
+from geometry_msgs.msg import Point
 from std_msgs.msg import Float32
 from visualization_msgs.msg import Marker, MarkerArray
 import numpy as np
 import casadi as ca
 from scipy.spatial import KDTree
+from scipy.interpolate import splprep, splev
 import math
-import pandas as pd
 import os
+import sys
 
-# --- CONSTANTS ---
+# --- TUNING ---
 DT = 0.05
-N_HORIZON = 20
+N_HORIZON = 10
 L_VEHICLE = 0.33
-W_TRACK = 4.0
-FILENAME = 'raceline_2.csv' 
+FILENAME = 'raceline_2.csv'
 
-MAX_STEER_RAD = 0.52 
-MAX_ACCEL = 5.0 
-SAFETY_MARGIN = 0.3 
+# --- CRITICAL CONFIG ---
+# Try -1.0 if car spins. Try 1.0 if it steers normally.
+STEER_GAIN = -1.0  
 
-# --- LAP 0 SETTINGS ---
-LAP0_SPEED = 2.0 
+# --- ALPP SETTINGS ---
+ALPP_MAX_SPEED = 2.0
+ALPP_LOOKAHEAD_MIN = 1.0
+ALPP_LOOKAHEAD_MAX = 2.5
+
+def normalize_angle(angle):
+    return (angle + np.pi) % (2 * np.pi) - np.pi
+
+def euler_to_quaternion(yaw):
+    return [0.0, 0.0, math.sin(yaw / 2.0), math.cos(yaw / 2.0)]
 
 class TrackManager:
-    def __init__(self, filename, width=4.0):
-        self.width = width
-        self.path = None
-        self.widths = None
-        
+    def __init__(self, filename, logger):
+        self.logger = logger
         if not os.path.exists(filename): filename = os.path.join(os.getcwd(), filename)
-        if os.path.exists(filename):
-            print(f"Loading track from {filename}...")
-            try:
-                data = np.loadtxt(filename, delimiter=',', skiprows=1)
-            except:
-                try: data = np.loadtxt(filename, skiprows=1)
-                except: self.generate_fallback_track(); return
-
-            if data.shape[1] == 3:
-                self.path = data[:, :2]
-                w = data[:, 2].reshape(-1, 1)
-                self.widths = np.hstack((w, w)) 
-            elif data.shape[1] >= 4:
-                self.path = data[:, :2]
-                self.widths = data[:, 2:4] 
-            else:
-                self.path = data[:, :2]
-                self.widths = np.ones((data.shape[0], 2)) * (width / 2.0)
-        else:
-            self.generate_fallback_track()
+        
+        try:
+            raw_data = np.loadtxt(filename, delimiter=',', skiprows=1)
+            raw_path = raw_data[:, :2]
             
-        self.N_points = self.path.shape[0]
-        self.kdtree = KDTree(self.path)
-        self.process_path()
+            # Interpolation (10cm resolution)
+            diffs = np.linalg.norm(np.diff(raw_path, axis=0), axis=1)
+            valid = np.insert(diffs > 0.01, 0, True)
+            clean = raw_path[valid]
+            
+            tck, u = splprep(clean.T, s=0, k=3, per=1)
+            u_new = np.linspace(u.min(), u.max(), int(np.sum(diffs)/0.1))
+            x_new, y_new = splev(u_new, tck)
+            
+            self.path = np.vstack((x_new, y_new)).T
+            self.N_points = len(self.path)
+            
+            # Headings
+            dx = np.gradient(self.path[:, 0])
+            dy = np.gradient(self.path[:, 1])
+            self.headings = np.arctan2(dy, dx)
+            
+            self.tree = KDTree(self.path)
+            self.logger.info(f"TRACK LOADED: {self.N_points} points.")
+            
+        except Exception as e:
+            self.logger.error(f"TRACK FAIL: {e}")
+            theta = np.linspace(0, 2*np.pi, 200)
+            self.path = np.vstack((10 * np.cos(theta), 6 * np.sin(theta))).T
+            self.N_points = 200
+            self.headings = theta + np.pi/2
+            self.tree = KDTree(self.path)
 
-    def generate_fallback_track(self):
-        theta = np.linspace(0, 2*np.pi, 200); a, b = 10.0, 6.0 
-        self.path = np.vstack((a * np.cos(theta), b * np.sin(theta))).T
-        self.widths = np.ones((200, 2)) * 2.0
+    def get_reference(self, x, y, last_idx):
+        # Window Search
+        best_dist = float('inf'); best_idx = last_idx
+        
+        for i in range(200): # Look 20m ahead
+            idx = (last_idx + i) % self.N_points
+            d = (self.path[idx,0]-x)**2 + (self.path[idx,1]-y)**2
+            if d < best_dist: best_dist = d; best_idx = idx
+        
+        # Global Rescue if lost
+        if best_dist > 25.0: # >5m error
+             dist, idx = self.tree.query([x, y])
+             best_idx = idx
+             best_dist = dist**2
 
-    def process_path(self):
-        x, y = self.path[:, 0], self.path[:, 1]
-        dx, dy = np.gradient(x), np.gradient(y)
-        ddx, ddy = np.gradient(dx), np.gradient(dy)
-        self.headings = np.arctan2(dy, dx)
-        denom = (dx**2 + dy**2)**1.5 + 1e-6
-        self.curvature = (dx * ddy - dy * ddx) / denom
+        ref_x, ref_y, ref_psi = [], [], []
+        curr = best_idx
+        for _ in range(N_HORIZON + 1):
+            ref_x.append(self.path[curr, 0])
+            ref_y.append(self.path[curr, 1])
+            ref_psi.append(self.headings[curr])
+            curr = (curr + 2) % self.N_points
+            
+        return np.array(ref_x), np.array(ref_y), np.array(ref_psi), 2.0, best_idx, math.sqrt(best_dist)
 
-    def get_reference(self, x_car, y_car, horizon):
-        dist, idx = self.kdtree.query([x_car, y_car])
-        indices = np.arange(idx, idx + horizon + 1) % self.N_points
-        ref_x = self.path[indices, 0]; ref_y = self.path[indices, 1]
-        ref_psi = np.unwrap(self.headings[indices])
-        ref_w_right = self.widths[indices, 0]; ref_w_left = self.widths[indices, 1]
-        k_max = np.max(np.abs(self.curvature[indices]))
-        v_limit = np.clip(np.sqrt(4.0 / (k_max + 1e-3)), 1.0, 4.0)
-        return ref_x, ref_y, ref_psi, ref_w_right, ref_w_left, v_limit, idx, dist
+class AdaptivePurePursuitController:
+    def __init__(self, track):
+        self.track = track; self.wheelbase = L_VEHICLE
+        self.max_speed = ALPP_MAX_SPEED
+    
+    def compute(self, x_curr, last_idx):
+        px, py, v, yaw = x_curr
+        L = np.clip(1.0 + (v-0.5)*1.0, 1.0, 2.5)
+        goal = None
+        for i in range(last_idx, last_idx + 500):
+            idx = i % self.track.N_points
+            pt = self.track.path[idx]
+            dist = math.hypot(pt[0]-px, pt[1]-py)
+            dx_local = (pt[0]-px)*math.cos(-yaw) - (pt[1]-py)*math.sin(-yaw)
+            if dist > L and dx_local > 0: goal = pt; break
+        if goal is None: goal = self.track.path[(last_idx+50)%self.track.N_points]
+        alpha = normalize_angle(math.atan2(goal[1]-py, goal[0]-px) - yaw)
+        steer = math.atan2(2*self.wheelbase*math.sin(alpha), L)
+        return 1.0, float(steer * STEER_GAIN), goal
 
 class LMPCLearner:
-    def __init__(self):
-        self.X_log = []
-        self.U_log = []
-        self.X_next_log = []
-        
-        # We only learn the Bias (Ce) to ensure stability
-        # Ae and Be are 0 (Trust the Nominal Model gradients)
-        self.Ce = np.zeros((4,1))
-        self.tree = None
+    def __init__(self, logger):
+        self.logger = logger
+        self.X_feat = None; self.Y_err = None; self.tree = None
+        self.Ae = np.zeros((2, 1)); self.Be = np.zeros((2, 2)); self.Ce = np.zeros((2, 1))
 
-    def add_data(self, X, U, X_next):
-        if len(self.X_log) == 0:
-            self.X_log = X; self.U_log = U; self.X_next_log = X_next
+    def add_data(self, X_log, U_log, X_next_log, X_nom_log):
+        # Errors [v, yaw]
+        global_err = X_next_log - X_nom_log
+        v_err = global_err[:, 2:3]
+        yaw_err = global_err[:, 3:4]
+        
+        feats = X_log[:, 2:3] # Velocity only
+        targets = np.hstack((v_err, yaw_err))
+        
+        if self.X_feat is None:
+            self.X_feat = feats; self.Y_err = targets; self.U_log = U_log; self.X_search = X_log[:, :2]
         else:
-            self.X_log = np.vstack((self.X_log, X))
-            self.U_log = np.vstack((self.U_log, U))
-            self.X_next_log = np.vstack((self.X_next_log, X_next))
-        
-        self.tree = KDTree(self.X_log[:, :2])
-        print(f"LMPC Memory: {self.X_log.shape[0]} points. Learning Updated.")
+            self.X_feat = np.vstack((self.X_feat, feats))
+            self.Y_err = np.vstack((self.Y_err, targets))
+            self.U_log = np.vstack((self.U_log, U_log))
+            self.X_search = np.vstack((self.X_search, X_log[:, :2]))
 
-    def get_nominal_pred(self, x, u):
-        # Kinematic Bicycle Model (Same as MPC)
-        beta = math.atan(0.5 * math.tan(u[1]))
-        x_next = np.zeros(4)
-        x_next[0] = x[0] + x[2] * math.cos(x[3] + beta) * DT
-        x_next[1] = x[1] + x[2] * math.sin(x[3] + beta) * DT
-        x_next[2] = x[2] + u[0] * DT
-        x_next[3] = x[3] + (x[2] / L_VEHICLE) * math.sin(beta) * DT
-        return x_next
+        if self.X_feat.shape[0] > 6000:
+            idx = np.random.choice(self.X_feat.shape[0], 5000, replace=False)
+            self.X_feat = self.X_feat[idx]; self.Y_err = self.Y_err[idx]
+            self.U_log = self.U_log[idx]; self.X_search = self.X_search[idx]
+        self.tree = KDTree(self.X_search)
 
     def update_error_model(self, x_curr):
-        if self.tree is None: return
+        if self.X_feat is None: return
+        dist, idx = self.tree.query(x_curr[:2], k=30)
+        h = 3.0; w = np.where(dist/h < 1, 0.75*(1-(dist/h)**2), 0.0)
         
-        # Find 20 nearest points in history
-        dist, idx = self.tree.query(x_curr[:2], k=20)
-        
-        error_sum = np.zeros(4)
-        valid_points = 0
-        
-        for i in idx:
-            # Reconstruct what the Nominal Model WOULD have predicted
-            x_hist = self.X_log[i]
-            u_hist = self.U_log[i]
-            x_next_actual = self.X_next_log[i]
-            
-            x_next_nominal = self.get_nominal_pred(x_hist, u_hist)
-            
-            # Error = Real - Nominal
-            error_sum += (x_next_actual - x_next_nominal)
-            valid_points += 1
-            
-        if valid_points > 0:
-            # Average error becomes our "Ce" (Additive Disturbance)
-            # We apply a low-pass filter (alpha=0.2) to smooth it out
-            new_Ce = (error_sum / valid_points).reshape(4,1)
-            self.Ce = 0.8 * self.Ce + 0.2 * new_Ce
+        if np.sum(w) < 1e-3: 
+            self.Ae *= 0; self.Be *= 0; self.Ce *= 0; return 
+        W = np.diag(w)
+        Z = np.hstack((self.X_feat[idx], self.U_log[idx], np.ones((len(idx), 1))))
+        E = self.Y_err[idx]
+        try:
+            Theta = (np.linalg.inv(Z.T @ W @ Z + 1e-3*np.eye(Z.shape[1])) @ Z.T @ W @ E).T
+            if np.isnan(Theta).any(): return
+            alpha = 0.2
+            self.Ae = (1-alpha)*self.Ae + alpha*Theta[:, 0:1]
+            self.Be = (1-alpha)*self.Be + alpha*Theta[:, 1:3]
+            self.Ce = (1-alpha)*self.Ce + alpha*Theta[:, 3:4]
+        except: pass
 
 class CasadiMPC:
-    def __init__(self):
+    def __init__(self, logger):
+        self.logger = logger
         self.opti = ca.Opti(); self.N = N_HORIZON
-        self.X = self.opti.variable(4, self.N + 1); self.U = self.opti.variable(2, self.N)
-        self.P_x0 = self.opti.parameter(4); self.P_ref = self.opti.parameter(3, self.N + 1)
+        self.X = self.opti.variable(4, self.N+1)
+        self.U = self.opti.variable(2, self.N)
+        self.slack = self.opti.variable(self.N+1)
+        
+        self.P_x0 = self.opti.parameter(4); self.P_ref = self.opti.parameter(3, self.N+1)
         self.P_v_tgt = self.opti.parameter(1); self.P_u_prev = self.opti.parameter(2)
-        self.P_w_right = self.opti.parameter(self.N + 1); self.P_w_left = self.opti.parameter(self.N + 1)
-        
-        # Learned Error Parameter (Additive Only)
-        self.P_Ce = self.opti.parameter(4, 1)
-        
-        self.Sl_right = self.opti.variable(self.N + 1); self.Sl_left = self.opti.variable(self.N + 1)
+        self.P_Ae = self.opti.parameter(2,1); self.P_Be = self.opti.parameter(2,2); self.P_Ce = self.opti.parameter(2,1)
+        self.P_learn_w = self.opti.parameter(1)
 
         cost = 0
         for k in range(self.N):
-            # Tracking Cost
-            cost += 2.0*((self.X[0,k]-self.P_ref[0,k])**2 + (self.X[1,k]-self.P_ref[1,k])**2) 
-            cost += 1.0*(self.X[2,k]-self.P_v_tgt)**2
-            
-            # Input Smoothness
-            if k == 0:
-                delta_u_acc = (self.U[0, k] - self.P_u_prev[0])**2
-                delta_u_steer = (self.U[1, k] - self.P_u_prev[1])**2
-            else:
-                delta_u_acc = (self.U[0, k] - self.U[0, k-1])**2
-                delta_u_steer = (self.U[1, k] - self.U[1, k-1])**2
-            
-            cost += 5.0*delta_u_acc + 50.0*delta_u_steer + 0.1*self.U[0, k]**2
-            cost += 100000.0 * (self.Sl_right[k]**2 + self.Sl_left[k]**2)
-
+            dist_sq = (self.X[0,k]-self.P_ref[0,k])**2 + (self.X[1,k]-self.P_ref[1,k])**2
+            err_vel = (self.X[2,k]-self.P_v_tgt)**2
+            if k == 0: du = (self.U[:,k]-self.P_u_prev)**2
+            else: du = (self.U[:,k]-self.U[:,k-1])**2
+            cost += 10.0*dist_sq + 1.0*err_vel + 500.0*du[1] + 10.0*du[0] + 5.0*self.U[1,k]**2
+        cost += 100000.0 * ca.sumsqr(self.slack)
         self.opti.minimize(cost)
 
         for k in range(self.N):
-            x_k, u_k = self.X[:, k], self.U[:, k]
+            x, u = self.X[:,k], self.U[:,k]
+            # APPLY STEER GAIN IN SOLVER TOO
+            steer_eff = u[1] * STEER_GAIN 
+            beta = ca.atan(0.5*ca.tan(steer_eff))
             
-            # Track Constraints
-            ref_x, ref_y, ref_psi = self.P_ref[0, k], self.P_ref[1, k], self.P_ref[2, k]
-            lateral_error = -ca.sin(ref_psi) * (x_k[0] - ref_x) + ca.cos(ref_psi) * (x_k[1] - ref_y)
-            max_right = self.P_w_right[k] - SAFETY_MARGIN; max_left = self.P_w_left[k] - SAFETY_MARGIN
-            self.opti.subject_to(lateral_error <= max_right + self.Sl_right[k])
-            self.opti.subject_to(lateral_error >= -max_left - self.Sl_left[k])
-            self.opti.subject_to(self.Sl_right[k] >= 0); self.opti.subject_to(self.Sl_left[k] >= 0)
-
-            # Dynamics: x_next = f(x,u) + Ce
-            beta = ca.atan(0.5 * ca.tan(u_k[1]))
-            x_nom = ca.vertcat(x_k[0] + x_k[2] * ca.cos(x_k[3] + beta) * DT,
-                               x_k[1] + x_k[2] * ca.sin(x_k[3] + beta) * DT,
-                               x_k[2] + u_k[0] * DT,
-                               x_k[3] + (x_k[2] / L_VEHICLE) * ca.sin(beta) * DT)
+            x_nom_0 = x[0]+x[2]*ca.cos(x[3]+beta)*DT
+            x_nom_1 = x[1]+x[2]*ca.sin(x[3]+beta)*DT
+            x_nom_2 = x[2]+u[0]*DT
+            x_nom_3 = x[3]+(x[2]/L_VEHICLE)*ca.sin(beta)*DT
             
-            # Add the learned error term here
-            self.opti.subject_to(self.X[:, k+1] == x_nom + self.P_Ce)
+            err = ca.mtimes(self.P_Ae, x[2]) + ca.mtimes(self.P_Be, u) + self.P_Ce
+            x_next_2 = x_nom_2 + err[0]*self.P_learn_w
+            x_next_3 = x_nom_3 + err[1]*self.P_learn_w
+            
+            self.opti.subject_to(self.X[:,k+1] == ca.vertcat(x_nom_0, x_nom_1, x_next_2, x_next_3))
+            
+            dist_sq = (x[0]-self.P_ref[0,k])**2 + (x[1]-self.P_ref[1,k])**2
+            self.opti.subject_to(dist_sq <= 9.0 + self.slack[k])
 
-        self.opti.subject_to(self.X[:, 0] == self.P_x0)
-        self.opti.subject_to(self.U[0, :] <= MAX_ACCEL); self.opti.subject_to(self.U[0, :] >= -MAX_ACCEL)
-        self.opti.subject_to(self.U[1, :] <= 0.45); self.opti.subject_to(self.U[1, :] >= -0.45)
-        self.opti.solver('ipopt', {'ipopt.print_level': 0, 'print_time': 0, 'ipopt.max_iter': 80, 'ipopt.warm_start_init_point': 'yes'})
+        self.opti.subject_to(self.X[:,0]==self.P_x0)
+        self.opti.subject_to(self.slack>=0)
+        self.opti.subject_to(self.opti.bounded(-5.0, self.U[0,:], 5.0))
+        self.opti.subject_to(self.opti.bounded(-0.6, self.U[1,:], 0.6))
+        self.opti.subject_to(self.opti.bounded(-2.0, self.X[2,:], 20.0))
+        self.opti.solver('ipopt', {'ipopt.print_level':0, 'print_time':0, 'ipopt.max_iter':80, 'ipopt.warm_start_init_point':'yes'})
 
-    def solve(self, x0, ref, w_right, w_left, v_tgt, Ce, u_prev):
-        self.opti.set_value(self.P_x0, x0); self.opti.set_value(self.P_ref, np.vstack(ref))
-        self.opti.set_value(self.P_w_right, w_right); self.opti.set_value(self.P_w_left, w_left)
-        self.opti.set_value(self.P_v_tgt, v_tgt)
-        self.opti.set_value(self.P_Ce, Ce) # Pass the learned error
-        self.opti.set_value(self.P_u_prev, u_prev)
+    def safe_set(self, param, value, shape=None):
+        if np.any(np.isnan(value)) or np.any(np.isinf(value)):
+            if shape: self.opti.set_value(param, np.zeros(shape))
+            else: self.opti.set_value(param, 0.0)
+        else:
+            self.opti.set_value(param, value)
+
+    def solve(self, x0, ref, v, Ae, Be, Ce, u_prev, w):
+        if np.isnan(x0).any(): return None
+        self.safe_set(self.P_x0, x0); self.safe_set(self.P_ref, np.vstack(ref))
+        self.safe_set(self.P_v_tgt, v); self.safe_set(self.P_u_prev, u_prev)
+        self.safe_set(self.P_Ae, Ae, (2,1)); self.safe_set(self.P_Be, Be, (2,2)); self.safe_set(self.P_Ce, Ce, (2,1))
+        self.safe_set(self.P_learn_w, w)
         
-        self.opti.set_initial(self.X, np.repeat(x0.reshape(-1,1), self.N+1, axis=1))
-        self.opti.set_initial(self.Sl_right, 0.0); self.opti.set_initial(self.Sl_left, 0.0)
+        x_guess = np.zeros((4, self.N+1)); x_guess[:, 0] = x0; curr = x0.copy()
+        for k in range(self.N):
+            beta = math.atan(0.5*math.tan(u_prev[1]*STEER_GAIN))
+            curr[0]+=curr[2]*math.cos(curr[3]+beta)*DT; curr[1]+=curr[2]*math.sin(curr[3]+beta)*DT
+            curr[2]+=u_prev[0]*DT; curr[3]+=(curr[2]/L_VEHICLE)*math.sin(beta)*DT
+            x_guess[:,k+1] = curr
+        self.opti.set_initial(self.X, x_guess)
+        self.opti.set_initial(self.U, np.tile(u_prev.reshape(2,1), (1, self.N)))
+        self.opti.set_initial(self.slack, 0.0)
         
-        try: 
+        try:
             sol = self.opti.solve()
-            return sol.value(self.U)[:, 0], sol.value(self.X)
-        except:
-            return None, None
+            return sol.value(self.U)[:,0], sol.value(self.X)
+        except: return None
 
 class LMPCNode(Node):
     def __init__(self):
         super().__init__('lmpc_node')
-        self.declare_parameter('throttle_topic', '/autodrive/f1tenth_1/throttle_command')
-        self.declare_parameter('steering_topic', '/autodrive/f1tenth_1/steering_command')
-        self.declare_parameter('pose_topic', '/autodrive/f1tenth_1/ips')
-
-        self.track = TrackManager(FILENAME, W_TRACK)
-        self.mpc = CasadiMPC()
-        self.learner = LMPCLearner()
-
-        self.current_state = None; self.prev_state = None; self.prev_u = np.zeros(2)
-        self.prev_pose = None; self.prev_pose_time = None
-        self.last_yaw = 0.0; self.unwrapped_yaw = 0.0; self.first_run = True
-        self.lap_data = {'X':[], 'U':[], 'X_next':[]}; self.lap_count = 0; self.aggressiveness = 0.5; self.is_racing = False
-
-        self.pub_throttle = self.create_publisher(Float32, self.get_parameter('throttle_topic').value, 10)
-        self.pub_steering = self.create_publisher(Float32, self.get_parameter('steering_topic').value, 10)
-        self.pub_reset = self.create_publisher(PoseWithCovarianceStamped, '/initialpose', 10)
+        self.sub = self.create_subscription(Point, '/autodrive/f1tenth_1/ips', self.cb_pose, 10)
+        self.pub_th = self.create_publisher(Float32, '/autodrive/f1tenth_1/throttle_command', 10)
+        self.pub_st = self.create_publisher(Float32, '/autodrive/f1tenth_1/steering_command', 10)
+        self.pub_viz = self.create_publisher(Marker, '/mpc_path', 10)
+        self.pub_ref = self.create_publisher(Marker, '/mpc_ref', 10)
+        self.pub_arr = self.create_publisher(MarkerArray, '/ref_arrows', 10)
+        self.pub_walls = self.create_publisher(Marker, '/track_walls', 10)
+        self.pub_viz_goal = self.create_publisher(Marker, '/alpp_goal', 10)
         
-        self.pub_viz_path = self.create_publisher(Marker, '/mpc_path', 10)
-        self.pub_ref_path = self.create_publisher(Marker, '/reference_path', 10)
-        self.pub_goal = self.create_publisher(Marker, '/goal_point', 10)
-        self.pub_global_track = self.create_publisher(Marker, '/global_track', 10)
-        self.pub_boundaries = self.create_publisher(Marker, '/track_boundaries', 10)
-        self.pub_lap_info = self.create_publisher(Marker, '/lap_info', 10)
-
-        self.create_subscription(Point, self.get_parameter('pose_topic').value, self._pose_cb, 10)
+        self.track = TrackManager(FILENAME, self.get_logger())
+        self.mpc = CasadiMPC(self.get_logger())
+        self.learner = LMPCLearner(self.get_logger())
+        self.alpp = AdaptivePurePursuitController(self.track)
+        
+        self.curr_x = None; self.prev_x = None; self.prev_u = np.zeros(2)
+        self.lap_data = {'X':[], 'U':[], 'X_n':[], 'X_nom':[]}
+        self.lap_count = 0; self.is_racing = False; self.last_idx = 0
         self.create_timer(DT, self.control_loop)
-        self.get_logger().info("LMPC Node Initialized. Waiting for Data...")
+        self.publish_walls()
+        self.get_logger().info(f"LMPC Ready. STEER_GAIN={STEER_GAIN}")
 
-    def _pose_cb(self, msg):
-        px = msg.x; py = msg.y
-        raw_yaw = self.last_yaw
-        if self.prev_pose is not None:
-             dx = px - self.prev_pose[0]; dy = py - self.prev_pose[1]
-             if math.hypot(dx, dy) > 0.05: raw_yaw = math.atan2(dy, dx)
-        
-        if self.first_run: self.unwrapped_yaw = raw_yaw; self.last_yaw = raw_yaw; self.first_run = False
+    def cb_pose(self, msg):
+        if hasattr(msg, 'pose'): px=msg.pose.pose.position.x; py=msg.pose.pose.position.y
+        else: px=msg.x; py=msg.y
+        if self.prev_x is None: yaw=0.0; v=0.0
         else:
-            diff = raw_yaw - self.last_yaw
-            if diff > math.pi: diff -= 2*math.pi
-            elif diff < -math.pi: diff += 2*math.pi
-            self.unwrapped_yaw += diff; self.last_yaw = raw_yaw
-
-        t = self.get_clock().now().nanoseconds / 1e9
-        v = 0.0
-        if self.prev_pose_time is not None:
-            dt = t - self.prev_pose_time
-            if dt > 1e-4:
-                dist = math.hypot(px - self.prev_pose[0], py - self.prev_pose[1])
-                v = dist / dt
-                if (px - self.prev_pose[0])*math.cos(self.unwrapped_yaw) + (py - self.prev_pose[1])*math.sin(self.unwrapped_yaw) < 0: v = -v
-
-        self.prev_pose = (px, py); self.prev_pose_time = t
-        self.current_state = np.array([px, py, v, self.unwrapped_yaw])
-
-    # --- NEW FUNCTION: AUTO-RECOVERY using ALPP Logic ---
-    def run_recovery_control(self, x, rx, ry):
-        dx = rx - x[0]; dy = ry - x[1]
-        dist_to_target = math.hypot(dx, dy)
-        local_x = dx * math.cos(-x[3]) - dy * math.sin(-x[3])
-        local_y = dx * math.sin(-x[3]) + dy * math.cos(-x[3])
-        
-        lookahead_dist = max(1.0, dist_to_target)
-        alpha = math.atan2(local_y, local_x)
-        steer_cmd = math.atan2(2.0 * L_VEHICLE * math.sin(alpha), lookahead_dist)
-        
-        target_v = 1.5 # Recovery Speed
-        if local_x < 0: target_v = -1.5; steer_cmd = -steer_cmd # Reverse
-            
-        accel_cmd = (target_v - x[2]) 
-        
-        t_msg = Float32(); t_msg.data = float(np.clip(accel_cmd, -1.0, 1.0))
-        s_msg = Float32(); s_msg.data = float(np.clip(steer_cmd, -MAX_STEER_RAD, MAX_STEER_RAD))
-        self.pub_throttle.publish(t_msg); self.pub_steering.publish(s_msg)
-        self.get_logger().warn(f"OFF TRACK! ALPP Recovery... Dist: {dist_to_target:.2f}m")
-        self.prev_state = None; self.prev_u = np.zeros(2)
-
-    def run_pure_pursuit(self, x, idx, v_max):
-        lookahead_dist = 2.0; lookahead_idx = int(lookahead_dist / 0.1)
-        target_i = (idx + lookahead_idx) % self.track.N_points
-        goal_point = self.track.path[target_i]
-        
-        gm = Marker(); gm.header.frame_id = 'map'; gm.type = Marker.SPHERE; gm.action = Marker.ADD
-        gm.pose.position.x = float(goal_point[0]); gm.pose.position.y = float(goal_point[1])
-        gm.scale.x = 0.5; gm.scale.y = 0.5; gm.scale.z = 0.5; gm.color.a = 1.0; gm.color.r = 1.0
-        self.pub_goal.publish(gm)
-
-        dx = float(goal_point[0] - x[0]); dy = float(goal_point[1] - x[1])
-        local_x = dx * math.cos(-x[3]) - dy * math.sin(-x[3])
-        local_y = dx * math.sin(-x[3]) + dy * math.cos(-x[3])
-        alpha = math.atan2(local_y, local_x)
-        
-        steer_cmd = math.atan2(2.0 * L_VEHICLE * math.sin(alpha), lookahead_dist)
-        target_v = LAP0_SPEED if self.lap_count == 0 else v_max
-        accel_cmd = (target_v - x[2])
-        return np.array([accel_cmd, steer_cmd]), np.zeros((2, N_HORIZON))
+            dx=px-self.prev_x[0]; dy=py-self.prev_x[1]
+            yaw=math.atan2(dy, dx) if math.hypot(dx,dy)>0.02 else self.prev_x[3]
+            v = 0.6*math.hypot(dx/DT, dy/DT) + 0.4*self.prev_x[2]
+        self.curr_x = np.array([px, py, v, yaw])
 
     def control_loop(self):
-        if self.current_state is None: return
-        x = self.current_state
-        rx, ry, rpsi, w_right, w_left, v_max, idx, dist = self.track.get_reference(x[0], x[1], N_HORIZON)
+        if self.curr_x is None: return
+        x = self.curr_x.copy()
         
-        # Crash Check
-        current_dx = x[0] - rx[0]; current_dy = x[1] - ry[0]
-        lat_error = -math.sin(rpsi[0]) * current_dx + math.cos(rpsi[0]) * current_dy
-        if lat_error > w_right[0] + 0.1 or lat_error < -w_left[0] - 0.1:
-            self.run_recovery_control(x, rx[0], ry[0]); return 
+        rx, ry, rpsi, v_max, idx, dist = self.track.get_reference(x[0], x[1], self.last_idx)
+        self.last_idx = idx 
+        self.viz_ref(rx, ry); self.viz_ref_arrows(rx, ry, rpsi)
 
-        if self.prev_state is not None and self.is_racing:
-             self.lap_data['X'].append(self.prev_state); self.lap_data['U'].append(self.prev_u)
-             self.lap_data['X_next'].append(x)
-             # Update Learning (Additive Error Only)
-             if self.lap_count > 0: self.learner.update_error_model(x)
+        diff = normalize_angle(x[3] - rpsi[0])
+        rpsi[0] = x[3] - diff
+        for i in range(1, len(rpsi)):
+             delta = normalize_angle(rpsi[i] - rpsi[i-1])
+             rpsi[i] = rpsi[i-1] + delta
 
-        if not self.is_racing and idx > 50: self.is_racing = True; self.get_logger().info(f"Lap {self.lap_count} STARTED!")
-        if self.is_racing and idx < 20 and len(self.lap_data['X']) > 200: self.finish_lap()
+        if not self.is_racing and idx > 50: self.is_racing = True
+        
+        is_moving = x[2]>0.1
+        if self.prev_x is not None and self.is_racing and is_moving:
+            beta = math.atan(0.5*math.tan(self.prev_u[1]*STEER_GAIN))
+            x_nom = np.zeros(4)
+            x_nom[0] = self.prev_x[0] + self.prev_x[2]*math.cos(self.prev_x[3]+beta)*DT
+            x_nom[1] = self.prev_x[1] + self.prev_x[2]*math.sin(self.prev_x[3]+beta)*DT
+            x_nom[2] = self.prev_x[2] + self.prev_u[0]*DT
+            x_nom[3] = self.prev_x[3] + (self.prev_x[2]/L_VEHICLE)*math.sin(beta)*DT
+            self.lap_data['X'].append(self.prev_x); self.lap_data['U'].append(self.prev_u)
+            self.lap_data['X_n'].append(x); self.lap_data['X_nom'].append(x_nom)
+            if len(self.lap_data['X'])%10==0: self.learner.update_error_model(x)
 
-        self.get_logger().info(f"Speed: {x[2]:.2f}, Yaw: {x[3]:.2f}")
+        if self.is_racing and idx < 20 and len(self.lap_data['X']) > 500 and is_moving: self.finish_lap()
 
-        if self.lap_count == 0:
-            u_opt, pred = self.run_pure_pursuit(x, idx, v_max)
+        u_acc, u_steer = 0.0, 0.0
+        
+        # SAFETY PILOT: If too far off track, override MPC with ALPP
+        safety_override = False
+        if dist > 1.0 and self.lap_count > 0:
+            self.get_logger().warn(f"Off Track ({dist:.2f}m) -> Safety Pilot (ALPP)")
+            safety_override = True
+
+        if self.lap_count == 0 or safety_override:
+            u_acc, u_steer, goal = self.alpp.compute(x, self.last_idx)
+            if goal is not None: self.viz_sphere(goal)
         else:
-            # LAP 1+: Use LMPC with Additive Error Correction (Robust)
-            u_opt, pred = self.mpc.solve(x, [rx, ry, rpsi], w_right, w_left, v_max * self.aggressiveness, 
-                                         self.learner.Ce, self.prev_u)
-            if u_opt is None:
-                self.get_logger().warn("LMPC Solver Failed! Using PP Fallback.")
-                u_opt, pred = self.run_pure_pursuit(x, idx, v_max)
+            v_tgt = min(x[2] + 1.0, v_max * min(1.0, 0.6 + 0.1*self.lap_count))
+            w = 1.0 if self.lap_count > 0 else 0.0
+            
+            res = self.mpc.solve(x, [rx, ry, rpsi], v_tgt, self.learner.Ae, self.learner.Be, self.learner.Ce, self.prev_u, w)
+            if res is not None:
+                u_acc, u_steer = res[0], res[1]
+                self.viz(res[1])
+            else:
+                self.get_logger().error("SOLVER FAIL -> Fallback ALPP")
+                u_acc, u_steer, _ = self.alpp.compute(x, self.last_idx)
+
+        # APPLY STEERING GAIN (INVERT IF NECESSARY)
+        final_steer = float(u_steer * STEER_GAIN)
         
-        t_msg = Float32(); t_msg.data = float(np.clip(u_opt[0]/MAX_ACCEL, -1.0, 1.0))
-        s_msg = Float32(); s_msg.data = float(np.clip(u_opt[1]/MAX_STEER_RAD, -1.0, 1.0))
-        self.pub_throttle.publish(t_msg); self.pub_steering.publish(s_msg)
-        
-        # Viz
-        m = Marker(); m.header.frame_id = "map"; m.type = Marker.LINE_STRIP; m.action = Marker.ADD; m.scale.x = 0.1; m.color.a = 1.0; m.color.g = 1.0
-        for i in range(pred.shape[1]): m.points.append(Point(x=float(pred[0,i]), y=float(pred[1,i])))
-        self.pub_viz_path.publish(m)
-        self.publish_global_track(); self.publish_lap_info()
-        self.prev_state = x.copy(); self.prev_u = u_opt.copy()
+        self.pub_th.publish(Float32(data=float(u_acc)))
+        self.pub_st.publish(Float32(data=final_steer))
+        self.prev_x = x.copy(); self.prev_u = np.array([u_acc, u_steer])
 
     def finish_lap(self):
-        self.learner.add_data(np.array(self.lap_data['X']), np.array(self.lap_data['U']), np.array(self.lap_data['X_next']))
-        self.get_logger().info(f"Lap {self.lap_count} COMPLETE.")
         self.lap_count += 1
-        if self.lap_count > 0: self.aggressiveness = min(1.0, self.aggressiveness + 0.1)
-        self.lap_data = {'X':[], 'U':[], 'X_next':[]}
+        if len(self.lap_data['X']) > 50:
+            self.learner.add_data(np.array(self.lap_data['X']), np.array(self.lap_data['U']), np.array(self.lap_data['X_n']), np.array(self.lap_data['X_nom']))
+        self.lap_data = {'X':[], 'U':[], 'X_n':[], 'X_nom':[]}
+        self.last_idx = 0
+        self.get_logger().info(f"Lap {self.lap_count} Start")
 
-    def publish_global_track(self):
-        msg = Marker(); msg.header.frame_id = "map"; msg.id = 1000; msg.type = Marker.LINE_STRIP; msg.action = Marker.ADD; msg.scale.x = 0.1; msg.color.a = 1.0; msg.color.b = 1.0 
-        for i in range(len(self.track.path)): msg.points.append(Point(x=float(self.track.path[i,0]), y=float(self.track.path[i,1])))
-        self.pub_global_track.publish(msg)
-        b_msg = Marker(); b_msg.header.frame_id = "map"; b_msg.id = 1001; b_msg.type = Marker.LINE_LIST; b_msg.action = Marker.ADD; b_msg.scale.x = 0.05; b_msg.color.a = 1.0; b_msg.color.r = 1.0
-        for i in range(0, len(self.track.path), 5):
-             x, y = self.track.path[i]; yaw = self.track.headings[i]; wr, wl = self.track.widths[i]
-             lx = x - math.sin(yaw)*wl; ly = y + math.cos(yaw)*wl
-             b_msg.points.append(Point(x=lx, y=ly, z=0.0)); b_msg.points.append(Point(x=lx, y=ly, z=0.5))
-             rx = x + math.sin(yaw)*wr; ry = y - math.cos(yaw)*wr
-             b_msg.points.append(Point(x=rx, y=ry, z=0.0)); b_msg.points.append(Point(x=rx, y=ry, z=0.5))
-        self.pub_boundaries.publish(b_msg)
+    def viz(self, pred):
+        m = Marker(); m.header.frame_id='world'; m.type=Marker.LINE_STRIP; m.scale.x=0.1; m.color.a=1.0; m.color.r=1.0
+        for i in range(pred.shape[1]): m.points.append(Point(x=float(pred[0,i]), y=float(pred[1,i])))
+        self.pub_viz.publish(m)
 
-    def publish_lap_info(self):
-        msg = Marker(); msg.header.frame_id = "map"; msg.id = 2000; msg.type = Marker.TEXT_VIEW_FACING; msg.action = Marker.ADD; msg.scale.z = 2.0; msg.color.a = 1.0; msg.color.r = 1.0; msg.color.g = 1.0
-        if self.current_state is not None:
-             msg.pose.position.x = self.current_state[0]; msg.pose.position.y = self.current_state[1]; msg.pose.position.z = 2.0
-             msg.text = "MODE: ALPP (Lap 0)" if self.lap_count == 0 else f"MODE: LMPC (Lap {self.lap_count})"
-        self.pub_lap_info.publish(msg)
+    def viz_ref(self, rx, ry):
+        m = Marker(); m.header.frame_id='world'; m.type=Marker.POINTS; m.scale.x=0.2; m.scale.y=0.2; m.color.a=1.0; m.color.b=1.0
+        for i in range(len(rx)): m.points.append(Point(x=float(rx[i]), y=float(ry[i])))
+        self.pub_ref.publish(m)
 
-def main(args=None):
-    rclpy.init(args=args); node = LMPCNode()
+    def viz_ref_arrows(self, rx, ry, rpsi):
+        ma = MarkerArray()
+        del_m = Marker(); del_m.action = Marker.DELETEALL
+        ma.markers.append(del_m)
+        for i in range(0, len(rx), 2):
+            m = Marker(); m.header.frame_id='world'; m.type=Marker.ARROW; m.id=i+100; m.action=Marker.ADD
+            m.scale.x=0.5; m.scale.y=0.1; m.scale.z=0.1; m.color.a=1.0; m.color.b=1.0
+            m.pose.position.x=rx[i]; m.pose.position.y=ry[i]
+            q = euler_to_quaternion(rpsi[i])
+            m.pose.orientation.x=q[0]; m.pose.orientation.y=q[1]; m.pose.orientation.z=q[2]; m.pose.orientation.w=q[3]
+            ma.markers.append(m)
+        self.pub_arr.publish(ma)
+
+    def viz_sphere(self, pt):
+        m = Marker(); m.header.frame_id='world'; m.type=Marker.SPHERE; m.action=Marker.ADD
+        m.scale.x=0.3; m.scale.y=0.3; m.scale.z=0.3; m.color.a=1.0; m.color.g=1.0
+        m.pose.position.x=pt[0]; m.pose.position.y=pt[1]
+        self.pub_viz_goal.publish(m)
+
+    def publish_walls(self):
+        m = Marker(); m.header.frame_id = 'world'; m.type = Marker.LINE_LIST
+        m.scale.x = 0.1; m.color.a = 0.5; m.color.r = 1.0; m.color.g = 1.0
+        for i in range(len(self.track.path)-1):
+            p1 = self.track.path[i]; p2 = self.track.path[i+1]
+            dx = p2[0]-p1[0]; dy = p2[1]-p1[1]; yaw = math.atan2(dy, dx)
+            rx = p1[0] + math.sin(yaw)*2.0; ry = p1[1] - math.cos(yaw)*2.0
+            lx = p1[0] - math.sin(yaw)*2.0; ly = p1[1] + math.cos(yaw)*2.0
+            m.points.append(Point(x=rx, y=ry, z=0.0)); m.points.append(Point(x=rx, y=ry, z=0.5))
+            m.points.append(Point(x=lx, y=ly, z=0.0)); m.points.append(Point(x=lx, y=ly, z=0.5))
+        self.pub_walls.publish(m)
+
+def main():
+    rclpy.init(); node = LMPCNode()
     try: rclpy.spin(node)
-    except KeyboardInterrupt: pass
-    finally: node.destroy_node(); rclpy.shutdown()
+    except: pass
+    node.destroy_node(); rclpy.shutdown()
 
 if __name__ == '__main__': main()
